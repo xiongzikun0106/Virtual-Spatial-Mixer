@@ -49,7 +49,18 @@ class TimelineWidget(QWidget):
 
     def set_playhead(self, time_sec: float):
         self._playhead_time = time_sec
+        self._ensure_playhead_visible()
         self.update()
+
+    def _ensure_playhead_visible(self):
+        x = self._time_to_x(self._playhead_time)
+        visible_left = 60
+        visible_right = self.width() - 20
+        if x > visible_right:
+            self._scroll_offset += (x - visible_right + 50)
+        elif x < visible_left and self._scroll_offset > 0:
+            target = self._playhead_time * self._pixels_per_second - 50
+            self._scroll_offset = max(0.0, target)
 
     def _time_to_x(self, t: float) -> float:
         return (t * self._pixels_per_second) - self._scroll_offset + 60

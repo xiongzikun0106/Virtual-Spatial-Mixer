@@ -193,7 +193,9 @@ class MainWindow(QMainWindow):
             self._trajectories[tid].record_frame(t, x, y, z)
 
     def _on_drag_start(self, tid: int):
-        pass
+        if self.audio_engine.playing:
+            self.audio_engine.pause()
+            self.toolbar.set_playing(False)
 
     def _on_drag_end(self, tid: int):
         if not self._recording:

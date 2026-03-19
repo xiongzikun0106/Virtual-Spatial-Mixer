@@ -40,20 +40,48 @@ class Viewport3D(QWidget):
         self.gl_widget.installEventFilter(self)
 
     def _add_origin_marker(self):
-        axis_len = 1.0
+        axis_len = 3.0
         axes = [
-            (np.array([[0, 0, 0], [axis_len, 0, 0]]), (1.0, 0.3, 0.3, 0.8)),  # X red
-            (np.array([[0, 0, 0], [0, axis_len, 0]]), (0.3, 1.0, 0.3, 0.8)),  # Y green
-            (np.array([[0, 0, 0], [0, 0, axis_len]]), (0.3, 0.3, 1.0, 0.8)),  # Z blue
+            (np.array([[0, 0, 0], [axis_len, 0, 0]]), (1.0, 0.3, 0.3, 0.8)),    # +X
+            (np.array([[0, 0, 0], [-axis_len, 0, 0]]), (1.0, 0.3, 0.3, 0.35)),   # -X
+            (np.array([[0, 0, 0], [0, axis_len, 0]]), (0.3, 0.3, 1.0, 0.8)),     # +Y (Front)
+            (np.array([[0, 0, 0], [0, -axis_len, 0]]), (0.3, 0.3, 1.0, 0.35)),   # -Y (Back)
+            (np.array([[0, 0, 0], [0, 0, axis_len]]), (0.3, 1.0, 0.3, 0.5)),     # +Z (Up)
         ]
         for pts, color in axes:
             item = gl.GLLinePlotItem(pos=pts, color=color, width=2.0, antialias=True)
             self.gl_widget.addItem(item)
 
+        label_offset = axis_len + 0.5
+        labels = [
+            (np.array([label_offset, 0, 0]), "右 R", (255, 80, 80, 255)),
+            (np.array([-label_offset, 0, 0]), "左 L", (255, 80, 80, 160)),
+            (np.array([0, label_offset, 0]), "前 F", (80, 80, 255, 255)),
+            (np.array([0, -label_offset, 0]), "后 B", (80, 80, 255, 160)),
+        ]
+        for pos, text, color in labels:
+            text_item = gl.GLTextItem(
+                pos=pos, text=text, color=color,
+            )
+            self.gl_widget.addItem(text_item)
+
+        head_size = 0.5
+        head_pts = np.array([
+            [0, head_size, 0.02],
+            [-head_size * 0.4, -head_size * 0.2, 0.02],
+            [0, 0, 0.02],
+            [head_size * 0.4, -head_size * 0.2, 0.02],
+            [0, head_size, 0.02],
+        ])
+        head_item = gl.GLLinePlotItem(
+            pos=head_pts, color=(1, 1, 1, 0.5), width=2.0, antialias=True,
+        )
+        self.gl_widget.addItem(head_item)
+
         origin = gl.GLScatterPlotItem(
             pos=np.array([[0, 0, 0]]),
-            color=(1, 1, 1, 0.8),
-            size=8,
+            color=(1, 1, 1, 0.9),
+            size=10,
             pxMode=True,
         )
         self.gl_widget.addItem(origin)

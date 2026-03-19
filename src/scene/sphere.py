@@ -69,14 +69,13 @@ class SoundSphere:
 
     @position.setter
     def position(self, pos):
-        old = self._position
         new = np.array(pos, dtype=np.float64)
-        delta = new - old
-        self.mesh_item.translate(*delta)
+        self.mesh_item.resetTransform()
+        self.mesh_item.translate(*new)
         self._position = new
 
     def set_glow(self, intensity: float):
-        """Adjust alpha to simulate glow based on gain."""
+        """Adjust brightness to simulate glow based on gain."""
         r, g, b = self.color[:3]
-        a = 0.4 + 0.6 * max(0.0, min(1.0, intensity))
-        self.mesh_item.setColor((r, g, b, a))
+        factor = 0.4 + 0.6 * max(0.0, min(1.0, intensity))
+        self.mesh_item.setColor((r * factor, g * factor, b * factor, 1.0))
