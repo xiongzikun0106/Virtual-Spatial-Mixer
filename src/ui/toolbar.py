@@ -1,12 +1,11 @@
-from PyQt6.QtWidgets import QToolBar, QToolButton, QLabel, QWidget, QHBoxLayout, QSizePolicy
-from PyQt6.QtCore import pyqtSignal, Qt
+from PyQt6.QtWidgets import QToolBar, QToolButton, QLabel, QWidget, QSizePolicy
+from PyQt6.QtCore import pyqtSignal
 
 
 class Toolbar(QToolBar):
     import_clicked = pyqtSignal()
-    play_clicked = pyqtSignal()
-    stop_clicked = pyqtSignal()
-    record_toggled = pyqtSignal(bool)
+    play_clicked   = pyqtSignal()
+    stop_clicked   = pyqtSignal()
     export_clicked = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -30,12 +29,6 @@ class Toolbar(QToolBar):
         self.btn_stop.setText("Stop")
         self.btn_stop.clicked.connect(self.stop_clicked.emit)
         self.addWidget(self.btn_stop)
-
-        self.btn_record = QToolButton()
-        self.btn_record.setText("Record")
-        self.btn_record.setCheckable(True)
-        self.btn_record.toggled.connect(self.record_toggled.emit)
-        self.addWidget(self.btn_record)
 
         self.addSeparator()
 
