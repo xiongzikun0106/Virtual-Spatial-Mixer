@@ -1,4 +1,15 @@
+"""
+Track Panel – left sidebar with per-track controls.
+
+Each TrackItem contains:
+  • Top row    : colour dot · name · remove (✕)
+  • Control row: S (solo) · M (mute) · ● REC · +KF · priority
+  • SpatialPad : 2D XZ bird's-eye positioning pad (always visible)
+  • Expand ▶   : detailed coordinate spinboxes (X / Z / Y / Dist / Angle)
+"""
+
 import math
+import numpy as np
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -9,26 +20,26 @@ from PyQt6.QtCore import pyqtSignal, Qt
 from src.ui.theme import (
     BG_PANEL, BG_LIGHTER, TEXT_PRIMARY, TEXT_SECONDARY, BORDER_COLOR, ACCENT,
 )
+from src.ui.spatial_pad import SpatialPad
 
 
 class TrackItem(QFrame):
-    """Per-track control container with coordinate inputs, keyframe and recording controls."""
+    """Per-track control panel integrating SpatialPad and coordinate spinboxes."""
 
-    solo_toggled     = pyqtSignal(int, bool)
-    mute_toggled     = pyqtSignal(int, bool)
-    priority_changed = pyqtSignal(int, int)
-    remove_clicked   = pyqtSignal(int)
-    # Emits internal coordinates: ix=pos[0] (X right/left),
-    #   iy=pos[1] (internal Y = user's Z front/back),
-    #   iz=pos[2] (internal Z = user's Y height)
-    coord_changed    = pyqtSignal(int, float, float, float)
-    keyframe_requested = pyqtSignal(int)   # track_id
-    rec_toggled      = pyqtSignal(int, bool)  # track_id, active
+    solo_toggled       = pyqtSignal(int, bool)
+    mute_toggled       = pyqtSignal(int, bool)
+    priority_changed   = pyqtSignal(int, int)
+    remove_clicked     = pyqtSignal(int)
+    # Internal coords: ix=X, iy=internal-Y (user Z front/back), iz=internal-Z (user Y height)
+    coord_changed      = pyqtSignal(int, float, float, float)
+    keyframe_requested = pyqtSignal(int)    # track_id
+    rec_toggled        = pyqtSignal(int, bool)   # track_id, active
 
     def __init__(self, track_id: int, name: str, color: tuple[int, int, int], parent=None):
         super().__init__(parent)
         self.track_id = track_id
-        self._updating = False  # guard against feedback loops
+        self._color = color
+        self._updating = False
 
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setStyleSheet(f"""
@@ -43,38 +54,34 @@ class TrackItem(QFrame):
         layout.setContentsMargins(6, 5, 6, 5)
         layout.setSpacing(3)
 
-        # ── Top row: color swatch · name · remove ──
-        top_row = QHBoxLayout()
-        top_row.setSpacing(5)
+        # ── Top row ──────────────────────────────────────────────
+        top = QHBoxLayout()
+        top.setSpacing(5)
         r, g, b = color
         dot = QLabel()
         dot.setFixedSize(10, 10)
-        dot.setStyleSheet(f"background-color: rgb({r},{g},{b}); border-radius: 5px;")
-        top_row.addWidget(dot)
+        dot.setStyleSheet(f"background-color:rgb({r},{g},{b}); border-radius:5px;")
+        top.addWidget(dot)
 
         name_lbl = QLabel(name)
-        name_lbl.setStyleSheet(
-            f"color: {TEXT_PRIMARY}; font-size: 11px; font-weight: bold;"
-        )
+        name_lbl.setStyleSheet(f"color:{TEXT_PRIMARY}; font-size:11px; font-weight:bold;")
         name_lbl.setToolTip(name)
-        top_row.addWidget(name_lbl, 1)
+        top.addWidget(name_lbl, 1)
 
         btn_rm = QPushButton("✕")
         btn_rm.setFixedSize(16, 16)
         btn_rm.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent; color: {TEXT_SECONDARY};
-                border: none; font-size: 10px;
-            }}
-            QPushButton:hover {{ color: #FF1744; }}
+            QPushButton {{ background:transparent; color:{TEXT_SECONDARY};
+                           border:none; font-size:10px; }}
+            QPushButton:hover {{ color:#FF1744; }}
         """)
         btn_rm.clicked.connect(lambda: self.remove_clicked.emit(self.track_id))
-        top_row.addWidget(btn_rm)
-        layout.addLayout(top_row)
+        top.addWidget(btn_rm)
+        layout.addLayout(top)
 
-        # ── Control row: S  M  ●REC  +KF  ···  P: [n] ──
-        ctrl_row = QHBoxLayout()
-        ctrl_row.setSpacing(3)
+        # ── Control row ───────────────────────────────────────────
+        ctrl = QHBoxLayout()
+        ctrl.setSpacing(3)
 
         self.btn_solo = QPushButton("S")
         self.btn_solo.setCheckable(True)
@@ -92,85 +99,82 @@ class TrackItem(QFrame):
         self.btn_rec.setCheckable(True)
         self.btn_rec.setFixedHeight(18)
         self.btn_rec.setStyleSheet(self._toggle_style("#FF1744"))
-        self.btn_rec.toggled.connect(lambda v: self.rec_toggled.emit(self.track_id, v))
+        self.btn_rec.toggled.connect(self._on_rec_toggled)
 
         self.btn_kf = QPushButton("+KF")
         self.btn_kf.setFixedHeight(18)
+        self.btn_kf.setToolTip("在当前播放时刻为此音轨添加关键帧\n快捷键: 拖动 SpatialPad 时按住会连续记录轨迹")
         self.btn_kf.setStyleSheet(f"""
-            QPushButton {{
-                background: {BG_PANEL}; color: {TEXT_SECONDARY};
-                border: 1px solid {BORDER_COLOR}; border-radius: 2px;
-                font-size: 9px; font-weight: bold;
-            }}
-            QPushButton:hover  {{ background: {ACCENT}; color: #000; }}
-            QPushButton:pressed {{ background: #00B8D4; color: #000; }}
+            QPushButton {{ background:{BG_PANEL}; color:{TEXT_SECONDARY};
+                           border:1px solid {BORDER_COLOR}; border-radius:2px;
+                           font-size:9px; font-weight:bold; }}
+            QPushButton:hover  {{ background:{ACCENT}; color:#000; }}
+            QPushButton:pressed {{ background:#00B8D4; color:#000; }}
         """)
         self.btn_kf.clicked.connect(lambda: self.keyframe_requested.emit(self.track_id))
 
         lbl_pri = QLabel("P:")
-        lbl_pri.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 9px;")
+        lbl_pri.setStyleSheet(f"color:{TEXT_SECONDARY}; font-size:9px;")
         self.spin_priority = QSpinBox()
         self.spin_priority.setRange(0, 10)
         self.spin_priority.setFixedSize(34, 18)
         self.spin_priority.setStyleSheet(f"""
-            QSpinBox {{
-                background: {BG_PANEL}; color: {TEXT_PRIMARY};
-                border: 1px solid {BORDER_COLOR}; font-size: 9px;
-            }}
+            QSpinBox {{ background:{BG_PANEL}; color:{TEXT_PRIMARY};
+                        border:1px solid {BORDER_COLOR}; font-size:9px; }}
         """)
         self.spin_priority.valueChanged.connect(
             lambda v: self.priority_changed.emit(self.track_id, v)
         )
 
-        ctrl_row.addWidget(self.btn_solo)
-        ctrl_row.addWidget(self.btn_mute)
-        ctrl_row.addWidget(self.btn_rec)
-        ctrl_row.addWidget(self.btn_kf)
-        ctrl_row.addStretch()
-        ctrl_row.addWidget(lbl_pri)
-        ctrl_row.addWidget(self.spin_priority)
-        layout.addLayout(ctrl_row)
+        ctrl.addWidget(self.btn_solo)
+        ctrl.addWidget(self.btn_mute)
+        ctrl.addWidget(self.btn_rec)
+        ctrl.addWidget(self.btn_kf)
+        ctrl.addStretch()
+        ctrl.addWidget(lbl_pri)
+        ctrl.addWidget(self.spin_priority)
+        layout.addLayout(ctrl)
 
-        # ── Expand/collapse button for coordinate section ──
-        self.btn_expand = QPushButton("▶  坐标控制")
+        # ── SpatialPad ────────────────────────────────────────────
+        self.pad = SpatialPad(track_id, color)
+        self.pad.position_changed.connect(self._on_pad_position)
+        layout.addWidget(self.pad)
+
+        # ── Expand / coordinate spinboxes ────────────────────────
+        self.btn_expand = QPushButton("▶  坐标精确控制")
         self.btn_expand.setCheckable(True)
         self.btn_expand.setFixedHeight(18)
         self.btn_expand.setStyleSheet(f"""
-            QPushButton {{
-                background: {BG_PANEL}; color: {TEXT_SECONDARY};
-                border: 1px solid {BORDER_COLOR}; border-radius: 2px;
-                font-size: 9px; text-align: left; padding-left: 4px;
-            }}
-            QPushButton:checked {{ color: {TEXT_PRIMARY}; border-color: {ACCENT}; }}
+            QPushButton {{ background:{BG_PANEL}; color:{TEXT_SECONDARY};
+                           border:1px solid {BORDER_COLOR}; border-radius:2px;
+                           font-size:9px; text-align:left; padding-left:4px; }}
+            QPushButton:checked {{ color:{TEXT_PRIMARY}; border-color:{ACCENT}; }}
         """)
-        self.btn_expand.toggled.connect(self._on_expand_toggled)
+        self.btn_expand.toggled.connect(self._on_expand)
         layout.addWidget(self.btn_expand)
 
-        # ── Coordinate input container (hidden until expanded) ──
         self.coord_widget = QWidget()
-        c_layout = QVBoxLayout(self.coord_widget)
-        c_layout.setContentsMargins(0, 2, 0, 0)
-        c_layout.setSpacing(2)
+        cl = QVBoxLayout(self.coord_widget)
+        cl.setContentsMargins(0, 2, 0, 0)
+        cl.setSpacing(2)
 
         spin_style = f"""
-            QDoubleSpinBox {{
-                background: {BG_PANEL}; color: {TEXT_PRIMARY};
-                border: 1px solid {BORDER_COLOR}; font-size: 10px; padding: 1px;
-            }}
-            QDoubleSpinBox:focus {{ border-color: {ACCENT}; }}
+            QDoubleSpinBox {{ background:{BG_PANEL}; color:{TEXT_PRIMARY};
+                              border:1px solid {BORDER_COLOR}; font-size:10px; padding:1px; }}
+            QDoubleSpinBox:focus {{ border-color:{ACCENT}; }}
         """
 
         def _row(label_text, spin):
             row = QHBoxLayout()
             row.setSpacing(4)
             lbl = QLabel(label_text)
-            lbl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 10px;")
-            lbl.setFixedWidth(56)
+            lbl.setStyleSheet(f"color:{TEXT_SECONDARY}; font-size:10px;")
+            lbl.setFixedWidth(60)
             row.addWidget(lbl)
             row.addWidget(spin)
             return row
 
-        # X  Right (+) / Left (-)  →  internal pos[0]
+        # X
         self.spin_x = QDoubleSpinBox()
         self.spin_x.setRange(-20.0, 20.0)
         self.spin_x.setSingleStep(0.1)
@@ -178,9 +182,9 @@ class TrackItem(QFrame):
         self.spin_x.setFixedHeight(20)
         self.spin_x.setStyleSheet(spin_style)
         self.spin_x.valueChanged.connect(self._on_xyz_changed)
-        c_layout.addLayout(_row("X  L/R:", self.spin_x))
+        cl.addLayout(_row("X  左/右:", self.spin_x))
 
-        # Z  Front (+) / Back (-)  →  internal pos[1]  (user labels as Z)
+        # Z front/back → internal pos[1]
         self.spin_z = QDoubleSpinBox()
         self.spin_z.setRange(-20.0, 20.0)
         self.spin_z.setSingleStep(0.1)
@@ -188,9 +192,9 @@ class TrackItem(QFrame):
         self.spin_z.setFixedHeight(20)
         self.spin_z.setStyleSheet(spin_style)
         self.spin_z.valueChanged.connect(self._on_xyz_changed)
-        c_layout.addLayout(_row("Z  F/B:", self.spin_z))
+        cl.addLayout(_row("Z  前/后:", self.spin_z))
 
-        # Y  Height  →  internal pos[2]  (user labels as Y)
+        # Y height → internal pos[2]
         self.spin_y = QDoubleSpinBox()
         self.spin_y.setRange(-10.0, 10.0)
         self.spin_y.setSingleStep(0.1)
@@ -198,9 +202,9 @@ class TrackItem(QFrame):
         self.spin_y.setFixedHeight(20)
         self.spin_y.setStyleSheet(spin_style)
         self.spin_y.valueChanged.connect(self._on_xyz_changed)
-        c_layout.addLayout(_row("Y  高度:", self.spin_y))
+        cl.addLayout(_row("Y  高度:", self.spin_y))
 
-        # Distance  (3D distance from origin, linked to gain)
+        # Distance
         self.spin_dist = QDoubleSpinBox()
         self.spin_dist.setRange(0.0, 30.0)
         self.spin_dist.setSingleStep(0.1)
@@ -208,9 +212,9 @@ class TrackItem(QFrame):
         self.spin_dist.setFixedHeight(20)
         self.spin_dist.setStyleSheet(spin_style)
         self.spin_dist.valueChanged.connect(self._on_polar_changed)
-        c_layout.addLayout(_row("Dist:", self.spin_dist))
+        cl.addLayout(_row("距离:", self.spin_dist))
 
-        # Angle  (horizontal azimuth from front, linked to pan)
+        # Angle
         self.spin_angle = QDoubleSpinBox()
         self.spin_angle.setRange(-180.0, 180.0)
         self.spin_angle.setSingleStep(1.0)
@@ -220,16 +224,37 @@ class TrackItem(QFrame):
         self.spin_angle.setFixedHeight(20)
         self.spin_angle.setStyleSheet(spin_style)
         self.spin_angle.valueChanged.connect(self._on_polar_changed)
-        c_layout.addLayout(_row("Angle:", self.spin_angle))
+        cl.addLayout(_row("方位角:", self.spin_angle))
 
         self.coord_widget.setVisible(False)
         layout.addWidget(self.coord_widget)
 
     # ── Expand toggle ─────────────────────────────────────────────
 
-    def _on_expand_toggled(self, checked: bool):
-        self.btn_expand.setText(("▼" if checked else "▶") + "  坐标控制")
+    def _on_expand(self, checked: bool):
+        self.btn_expand.setText(("▼" if checked else "▶") + "  坐标精确控制")
         self.coord_widget.setVisible(checked)
+
+    # ── Rec toggle ────────────────────────────────────────────────
+
+    def _on_rec_toggled(self, active: bool):
+        self.pad.set_recording(active)
+        self.rec_toggled.emit(self.track_id, active)
+
+    # ── SpatialPad drag → coord_changed ──────────────────────────
+
+    def _on_pad_position(self, ix: float, iy: float, iz: float):
+        """Forward SpatialPad drag to the main coord pipeline."""
+        self._updating = True
+        self.spin_x.setValue(ix)
+        self.spin_z.setValue(iy)
+        # iz unchanged (pad is XZ only)
+        dist = math.sqrt(ix * ix + iy * iy + iz * iz)
+        angle = math.degrees(math.atan2(ix, iy)) if (abs(ix) > 1e-9 or abs(iy) > 1e-9) else 0.0
+        self.spin_dist.setValue(dist)
+        self.spin_angle.setValue(angle)
+        self._updating = False
+        self.coord_changed.emit(self.track_id, ix, iy, self.spin_y.value())
 
     # ── Spinbox change handlers ───────────────────────────────────
 
@@ -237,14 +262,15 @@ class TrackItem(QFrame):
         if self._updating:
             return
         ix = self.spin_x.value()
-        iy = self.spin_z.value()   # user's Z → internal Y (front/back)
-        iz = self.spin_y.value()   # user's Y → internal Z (height)
+        iy = self.spin_z.value()   # user Z → internal Y
+        iz = self.spin_y.value()   # user Y → internal Z
 
         self._updating = True
         dist = math.sqrt(ix * ix + iy * iy + iz * iz)
         angle = math.degrees(math.atan2(ix, iy)) if (abs(ix) > 1e-9 or abs(iy) > 1e-9) else 0.0
         self.spin_dist.setValue(dist)
         self.spin_angle.setValue(angle)
+        self.pad.set_position(ix, iy, iz)
         self._updating = False
 
         self.coord_changed.emit(self.track_id, ix, iy, iz)
@@ -255,12 +281,13 @@ class TrackItem(QFrame):
         dist = self.spin_dist.value()
         angle_rad = math.radians(self.spin_angle.value())
         ix = dist * math.sin(angle_rad)
-        iy = dist * math.cos(angle_rad)   # internal Y = user's Z
-        iz = self.spin_y.value()          # height unchanged
+        iy = dist * math.cos(angle_rad)
+        iz = self.spin_y.value()
 
         self._updating = True
         self.spin_x.setValue(ix)
         self.spin_z.setValue(iy)
+        self.pad.set_position(ix, iy, iz)
         self._updating = False
 
         self.coord_changed.emit(self.track_id, ix, iy, iz)
@@ -268,22 +295,31 @@ class TrackItem(QFrame):
     # ── Public API ────────────────────────────────────────────────
 
     def set_position(self, ix: float, iy: float, iz: float):
-        """Programmatically set spinboxes from internal coordinates without emitting coord_changed."""
+        """Update all position displays without emitting coord_changed."""
         self._updating = True
         self.spin_x.setValue(ix)
-        self.spin_z.setValue(iy)   # user Z = internal Y
-        self.spin_y.setValue(iz)   # user Y = internal Z
+        self.spin_z.setValue(iy)
+        self.spin_y.setValue(iz)
         dist = math.sqrt(ix * ix + iy * iy + iz * iz)
         angle = math.degrees(math.atan2(ix, iy)) if (abs(ix) > 1e-9 or abs(iy) > 1e-9) else 0.0
         self.spin_dist.setValue(dist)
         self.spin_angle.setValue(angle)
+        self.pad.set_position(ix, iy, iz)
         self._updating = False
+
+    def set_trajectory(self, pts: np.ndarray | None, keyframes: list):
+        """Update SpatialPad motion path and keyframe diamonds."""
+        self.pad.set_trajectory(pts)
+        self.pad.set_keyframe_positions(keyframes)
+
+    def set_playing(self, active: bool):
+        self.pad.set_playing(active)
 
     def is_rec_active(self) -> bool:
         return self.btn_rec.isChecked()
 
     def stop_recording(self):
-        """Programmatically deactivate the rec button (triggers rec_toggled signal)."""
+        """Programmatically deactivate REC (triggers rec_toggled signal)."""
         if self.btn_rec.isChecked():
             self.btn_rec.setChecked(False)
 
@@ -292,39 +328,37 @@ class TrackItem(QFrame):
     @staticmethod
     def _toggle_style(active_color: str) -> str:
         return f"""
-            QPushButton {{
-                background: {BG_PANEL}; color: {TEXT_SECONDARY};
-                border: 1px solid {BORDER_COLOR}; border-radius: 2px;
-                font-size: 9px; font-weight: bold;
-            }}
-            QPushButton:checked {{ background: {active_color}; color: #000; }}
+            QPushButton {{ background:{BG_PANEL}; color:{TEXT_SECONDARY};
+                           border:1px solid {BORDER_COLOR}; border-radius:2px;
+                           font-size:9px; font-weight:bold; }}
+            QPushButton:checked {{ background:{active_color}; color:#000; }}
         """
 
 
 class TrackPanel(QWidget):
-    """Left sidebar: one TrackItem per audio track with full spatial control."""
+    """Left sidebar: one TrackItem per audio track."""
 
     solo_toggled       = pyqtSignal(int, bool)
     mute_toggled       = pyqtSignal(int, bool)
     priority_changed   = pyqtSignal(int, int)
     remove_clicked     = pyqtSignal(int)
-    coord_changed      = pyqtSignal(int, float, float, float)  # tid, ix, iy, iz
-    keyframe_requested = pyqtSignal(int)                       # tid
-    rec_toggled        = pyqtSignal(int, bool)                 # tid, active
+    coord_changed      = pyqtSignal(int, float, float, float)
+    keyframe_requested = pyqtSignal(int)
+    rec_toggled        = pyqtSignal(int, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedWidth(290)
-        self.setStyleSheet(f"background-color: {BG_PANEL};")
+        self.setFixedWidth(300)
+        self.setStyleSheet(f"background-color:{BG_PANEL};")
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
         outer.setSpacing(0)
 
-        header = QLabel("TRACKS")
-        header.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px; padding: 4px;")
-        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        outer.addWidget(header)
+        hdr = QLabel("TRACKS")
+        hdr.setStyleSheet(f"color:{TEXT_SECONDARY}; font-size:11px; padding:4px;")
+        hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        outer.addWidget(hdr)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -361,14 +395,22 @@ class TrackPanel(QWidget):
             item.deleteLater()
 
     def set_track_position(self, track_id: int, ix: float, iy: float, iz: float):
-        """Update coordinate spinboxes during playback (no signal emitted)."""
         if track_id in self._items:
             self._items[track_id].set_position(ix, iy, iz)
+
+    def update_track_trajectory(self, track_id: int,
+                                pts: np.ndarray | None, keyframes: list):
+        """Refresh the SpatialPad motion path and keyframe diamonds."""
+        if track_id in self._items:
+            self._items[track_id].set_trajectory(pts, keyframes)
+
+    def set_playing(self, active: bool):
+        for item in self._items.values():
+            item.set_playing(active)
 
     def get_rec_tracks(self) -> set[int]:
         return {tid for tid, item in self._items.items() if item.is_rec_active()}
 
     def stop_all_recording(self):
-        """Deactivate all rec buttons (each emits rec_toggled)."""
         for item in self._items.values():
             item.stop_recording()

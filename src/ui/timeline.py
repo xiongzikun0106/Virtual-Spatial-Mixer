@@ -1,45 +1,90 @@
-import numpy as np
-from PyQt6.QtWidgets import QWidget
-from PyQt6.QtCore import pyqtSignal, Qt, QRectF, QPointF
-from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QBrush, QMouseEvent, QPolygonF
+"""
+Timeline widget – AE-style keyframe editing.
 
-from src.ui.theme import (
-    BG_PANEL, BG_LIGHTER, GRID_COLOR, TEXT_PRIMARY, TEXT_SECONDARY,
-    PLAYHEAD_COLOR, MONO_FONT, BORDER_COLOR, ACCENT,
+Layout
+------
+  ┌─────────────────────────────────────────────────────┐
+  │  [ruler with time marks]                            │
+  ├──────┬──────────────────────────────────────────────┤
+  │ name │ waveform … ◇ ◇ ◇  keyframe diamonds …       │  ← per track row
+  └──────┴──────────────────────────────────────────────┘
+
+Interactions
+------------
+  • Left-click ruler             → seek to time
+  • Left-click + drag playhead  → scrub
+  • Left-click keyframe diamond  → seek to keyframe time + select it
+  • Left-drag keyframe diamond   → move keyframe in time
+  • Double-click track row       → add keyframe at that time
+  • Right-click keyframe         → context menu (Delete / Clear all)
+  • Ctrl + scroll                → zoom time axis
+  • Scroll                       → horizontal scroll
+
+Signals
+-------
+  seek_requested(float)            – time in seconds
+  keyframe_added(int, float)       – track_id, time_sec
+  keyframe_moved(int, int, float)  – track_id, kf_index, new_time
+  keyframe_deleted(int, int)       – track_id, kf_index
+  keyframes_cleared(int)           – track_id
+  keyframe_selected(int, int)      – track_id, kf_index  (seek+show pos)
+"""
+
+import numpy as np
+from PyQt6.QtWidgets import QWidget, QMenu, QToolTip
+from PyQt6.QtCore import pyqtSignal, Qt, QPointF
+from PyQt6.QtGui import (
+    QPainter, QColor, QFont, QPen, QBrush,
+    QMouseEvent, QPolygonF, QAction,
 )
 
-RULER_HEIGHT = 24
-TRACK_ROW_HEIGHT = 50
-KEYFRAME_RADIUS = 5
+from src.ui.theme import (
+    BG_PANEL, BG_LIGHTER, BORDER_COLOR, TEXT_PRIMARY, TEXT_SECONDARY,
+    PLAYHEAD_COLOR, MONO_FONT, ACCENT,
+)
+
+RULER_H = 26           # ruler strip height in pixels
+ROW_H   = 52           # height of each track row
+KF_HALF = 6            # diamond half-size in pixels
+LABEL_W = 64           # left label column width
 
 
 class TimelineWidget(QWidget):
-    """Custom-painted timeline showing waveform overviews, keyframes, and playhead."""
+    """AE-style timeline with waveforms, keyframe diamonds and playhead."""
 
-    seek_requested = pyqtSignal(float)  # time in seconds
-    keyframe_added = pyqtSignal(int, float)  # track_id, time_sec
-    keyframe_moved = pyqtSignal(int, int, float)  # track_id, kf_index, new_time
+    seek_requested    = pyqtSignal(float)         # time in seconds
+    keyframe_added    = pyqtSignal(int, float)    # track_id, time_sec
+    keyframe_moved    = pyqtSignal(int, int, float)  # track_id, kf_index, new_time
+    keyframe_deleted  = pyqtSignal(int, int)      # track_id, kf_index
+    keyframes_cleared = pyqtSignal(int)           # track_id
+    keyframe_selected = pyqtSignal(int, int)      # track_id, kf_index (for seek+info)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(120)
-        self.setFixedHeight(150)
+        self.setFixedHeight(160)
         self.setStyleSheet(f"background-color: {BG_PANEL};")
-
-        self._tracks: list[dict] = []
-        self._duration = 10.0
-        self._playhead_time = 0.0
-        self._pixels_per_second = 60.0
-        self._scroll_offset = 0.0
-
-        self._dragging_playhead = False
-        self._dragging_kf = None  # (track_idx, kf_idx)
-
         self.setMouseTracking(True)
 
+        self._tracks: list[dict] = []
+        self._duration: float = 10.0
+        self._playhead_time: float = 0.0
+        self._pixels_per_sec: float = 60.0
+        self._scroll_x: float = 0.0
+
+        # Interaction state
+        self._drag_playhead: bool = False
+        self._drag_kf: tuple[int, int] | None = None   # (track_idx, kf_idx)
+        self._selected_kf: tuple[int, int] | None = None
+
+    # ── Data API ──────────────────────────────────────────────────
+
     def set_tracks(self, tracks: list[dict]):
-        """tracks: [{"id": int, "name": str, "color": (r,g,b),
-                     "waveform": np.ndarray, "keyframes": [(t,x,y,z), ...]}]"""
+        """
+        tracks: list of dicts with keys:
+          id, name, color (r,g,b), waveform (np.ndarray), keyframes [(t,x,y,z)],
+          track_duration (float)
+        """
         self._tracks = tracks
         self.update()
 
@@ -47,206 +92,316 @@ class TimelineWidget(QWidget):
         self._duration = max(1.0, dur)
         self.update()
 
-    def set_playhead(self, time_sec: float):
-        self._playhead_time = time_sec
-        self._ensure_playhead_visible()
+    def set_playhead(self, t: float):
+        self._playhead_time = t
+        self._auto_scroll()
         self.update()
 
-    def _ensure_playhead_visible(self):
-        x = self._time_to_x(self._playhead_time)
-        visible_left = 60
-        visible_right = self.width() - 20
-        if x > visible_right:
-            self._scroll_offset += (x - visible_right + 50)
-        elif x < visible_left and self._scroll_offset > 0:
-            target = self._playhead_time * self._pixels_per_second - 50
-            self._scroll_offset = max(0.0, target)
+    # ── Coordinate helpers ────────────────────────────────────────
 
-    def _time_to_x(self, t: float) -> float:
-        return (t * self._pixels_per_second) - self._scroll_offset + 60
+    def _t2x(self, t: float) -> float:
+        return t * self._pixels_per_sec - self._scroll_x + LABEL_W
 
-    def _x_to_time(self, x: float) -> float:
-        return (x - 60 + self._scroll_offset) / self._pixels_per_second
+    def _x2t(self, x: float) -> float:
+        return (x - LABEL_W + self._scroll_x) / self._pixels_per_sec
+
+    def _auto_scroll(self):
+        x = self._t2x(self._playhead_time)
+        right = self.width() - 20
+        if x > right:
+            self._scroll_x += x - right + 60
+        elif x < LABEL_W and self._scroll_x > 0:
+            self._scroll_x = max(0.0, self._playhead_time * self._pixels_per_sec - 60)
+
+    # ── Paint ─────────────────────────────────────────────────────
 
     def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
 
-        painter.fillRect(0, 0, w, h, QColor(BG_PANEL))
+        p.fillRect(0, 0, w, h, QColor(BG_PANEL))
+        p.fillRect(0, 0, LABEL_W, h, QColor(BG_LIGHTER))
 
-        painter.fillRect(0, 0, 60, h, QColor(BG_LIGHTER))
+        self._paint_ruler(p, w)
+        self._paint_tracks(p, w, h)
+        self._paint_playhead(p, h)
+        p.end()
 
-        self._draw_ruler(painter, w)
-        self._draw_tracks(painter, w, h)
-        self._draw_playhead(painter, h)
+    def _paint_ruler(self, p: QPainter, w: int):
+        p.fillRect(0, 0, w, RULER_H, QColor("#1C1C1C"))
+        p.setPen(QPen(QColor(BORDER_COLOR), 1))
+        p.drawLine(0, RULER_H, w, RULER_H)
 
-        painter.end()
-
-    def _draw_ruler(self, painter: QPainter, width: int):
-        painter.setPen(QPen(QColor(TEXT_SECONDARY), 1))
-        font = QFont(MONO_FONT, 8)
-        painter.setFont(font)
-
+        font = QFont(MONO_FONT, 7)
+        p.setFont(font)
+        step = self._time_step()
         t = 0.0
-        step = self._nice_step()
         while t <= self._duration + step:
-            x = self._time_to_x(t)
-            if 60 <= x <= width:
-                painter.drawLine(int(x), 0, int(x), RULER_HEIGHT)
-                mins = int(t) // 60
-                secs = t - mins * 60
-                painter.drawText(int(x) + 2, RULER_HEIGHT - 4, f"{mins}:{secs:04.1f}")
+            x = int(self._t2x(t))
+            if LABEL_W <= x <= w:
+                p.setPen(QPen(QColor("#444444"), 1))
+                p.drawLine(x, RULER_H - 8, x, RULER_H)
+                m = int(t) // 60
+                s = t - m * 60
+                p.setPen(QColor(TEXT_SECONDARY))
+                p.drawText(x + 2, RULER_H - 8, f"{m}:{s:04.1f}")
             t += step
 
-    def _nice_step(self) -> float:
-        pps = self._pixels_per_second
-        if pps > 100:
-            return 0.5
-        if pps > 40:
-            return 1.0
-        if pps > 15:
-            return 5.0
+    def _time_step(self) -> float:
+        pps = self._pixels_per_sec
+        if pps > 120: return 0.5
+        if pps > 50:  return 1.0
+        if pps > 20:  return 5.0
         return 10.0
 
-    def _draw_tracks(self, painter: QPainter, width: int, height: int):
-        y_offset = RULER_HEIGHT
-        font = QFont(MONO_FONT, 9)
-        painter.setFont(font)
+    def _paint_tracks(self, p: QPainter, w: int, h: int):
+        font = QFont(MONO_FONT, 8)
+        p.setFont(font)
 
-        for i, track in enumerate(self._tracks):
-            y = y_offset + i * TRACK_ROW_HEIGHT
-            if y > height:
+        for ti, track in enumerate(self._tracks):
+            y = RULER_H + ti * ROW_H
+            if y >= h:
                 break
 
-            painter.setPen(QPen(QColor(BORDER_COLOR), 1))
-            painter.drawLine(0, y, width, y)
-
             r, g, b = track["color"]
-            painter.setPen(QPen(QColor(TEXT_PRIMARY), 1))
-            painter.drawText(4, y + TRACK_ROW_HEIGHT // 2 + 4, track["name"][:8])
+            track_color = QColor(r, g, b)
 
-            waveform = track.get("waveform")
-            if waveform is not None and len(waveform) > 0:
-                self._draw_waveform(painter, waveform, track["color"],
-                                    60, y + 4, width - 60, TRACK_ROW_HEIGHT - 8,
-                                    track.get("track_duration", self._duration))
+            # Row separator
+            p.setPen(QPen(QColor(BORDER_COLOR), 1))
+            p.drawLine(0, y, w, y)
 
-            keyframes = track.get("keyframes", [])
-            for ki, kf in enumerate(keyframes):
-                kf_time = kf[0]
-                kx = self._time_to_x(kf_time)
-                ky = y + TRACK_ROW_HEIGHT // 2
-                if 60 <= kx <= width:
-                    painter.setPen(QPen(QColor(r, g, b), 1))
-                    painter.setBrush(QBrush(QColor(r, g, b)))
-                    painter.drawEllipse(QPointF(kx, ky), KEYFRAME_RADIUS, KEYFRAME_RADIUS)
+            # Track label
+            p.fillRect(0, y, LABEL_W, ROW_H, QColor(BG_LIGHTER))
+            dot_x, dot_y = 8, y + ROW_H // 2
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(track_color))
+            p.drawEllipse(dot_x, dot_y - 4, 8, 8)
+            p.setPen(QColor(TEXT_PRIMARY))
+            name = track["name"][:7]
+            p.drawText(20, y + ROW_H // 2 + 4, name)
 
-        bottom_line_y = y_offset + len(self._tracks) * TRACK_ROW_HEIGHT
-        if bottom_line_y < height:
-            painter.setPen(QPen(QColor(BORDER_COLOR), 1))
-            painter.drawLine(0, bottom_line_y, width, bottom_line_y)
+            # Waveform
+            wf = track.get("waveform")
+            dur = track.get("track_duration", self._duration)
+            if wf is not None and len(wf) > 0:
+                self._paint_waveform(p, wf, track["color"], LABEL_W, y + 4,
+                                     w - LABEL_W, ROW_H - 8, dur)
 
-    def _draw_waveform(self, painter: QPainter, waveform: np.ndarray, color: tuple,
-                       x0: int, y0: int, w: int, h: int, duration: float):
+            # Keyframe count badge
+            kfs = track.get("keyframes", [])
+            if kfs:
+                badge_x = LABEL_W - 2
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(QColor(r, g, b, 160)))
+                p.drawRoundedRect(badge_x - 18, y + 3, 18, 11, 3, 3)
+                p.setPen(QColor(0, 0, 0))
+                p.setFont(QFont(MONO_FONT, 6))
+                p.drawText(badge_x - 16, y + 12, str(len(kfs)))
+                p.setFont(font)
+
+            # Keyframe diamonds
+            cy = y + ROW_H // 2
+            for ki, kf in enumerate(kfs):
+                kx = int(self._t2x(kf[0]))
+                if kx < LABEL_W or kx > w:
+                    continue
+                is_selected = self._selected_kf == (ti, ki)
+                self._paint_diamond(p, kx, cy, track_color, is_selected)
+
+        # Bottom border
+        bottom_y = RULER_H + len(self._tracks) * ROW_H
+        if bottom_y < h:
+            p.setPen(QPen(QColor(BORDER_COLOR), 1))
+            p.drawLine(0, bottom_y, w, bottom_y)
+
+    def _paint_diamond(self, p: QPainter, cx: int, cy: int,
+                       color: QColor, selected: bool):
+        hs = KF_HALF
+        pts = QPolygonF([
+            QPointF(cx,      cy - hs),
+            QPointF(cx + hs, cy),
+            QPointF(cx,      cy + hs),
+            QPointF(cx - hs, cy),
+        ])
+        if selected:
+            p.setPen(QPen(QColor(255, 255, 255, 230), 1.5))
+            p.setBrush(QBrush(QColor(255, 255, 255, 200)))
+        else:
+            p.setPen(QPen(QColor(255, 255, 255, 160), 1))
+            p.setBrush(QBrush(color))
+        p.drawPolygon(pts)
+
+    def _paint_waveform(self, p: QPainter, wf: np.ndarray, color: tuple,
+                        x0: int, y0: int, w: int, h: int, dur: float):
         r, g, b = color
-        painter.setPen(QPen(QColor(r, g, b, 80), 1))
-
-        n = len(waveform)
-        mid_y = y0 + h / 2
-        half_h = h / 2
-
+        p.setPen(QPen(QColor(r, g, b, 60), 1))
+        n = len(wf)
+        mid = y0 + h / 2
+        half = h / 2
         for i in range(min(n, w)):
-            t = (i / w) * duration
-            px = self._time_to_x(t)
+            t = (i / w) * dur
+            px = self._t2x(t)
             if px < x0 or px > x0 + w:
                 continue
-            idx = int(i / w * n)
-            idx = min(idx, n - 1)
-            amp = waveform[idx] * half_h
-            painter.drawLine(int(px), int(mid_y - amp), int(px), int(mid_y + amp))
+            idx = min(int(i / w * n), n - 1)
+            amp = wf[idx] * half
+            p.drawLine(int(px), int(mid - amp), int(px), int(mid + amp))
 
-    def _draw_playhead(self, painter: QPainter, height: int):
-        x = self._time_to_x(self._playhead_time)
-        painter.setPen(QPen(QColor(PLAYHEAD_COLOR), 2))
-        painter.drawLine(int(x), 0, int(x), height)
-
-        painter.setBrush(QBrush(QColor(PLAYHEAD_COLOR)))
-        triangle = QPolygonF([
-            QPointF(x - 5, 0),
-            QPointF(x + 5, 0),
-            QPointF(x, 8),
+    def _paint_playhead(self, p: QPainter, h: int):
+        x = int(self._t2x(self._playhead_time))
+        # Vertical line
+        p.setPen(QPen(QColor(PLAYHEAD_COLOR), 2))
+        p.drawLine(x, 0, x, h)
+        # Triangle head
+        p.setBrush(QBrush(QColor(PLAYHEAD_COLOR)))
+        tri = QPolygonF([
+            QPointF(x - 6, 0),
+            QPointF(x + 6, 0),
+            QPointF(x,     10),
         ])
-        painter.drawPolygon(triangle)
+        p.drawPolygon(tri)
+
+    # ── Mouse events ──────────────────────────────────────────────
 
     def mousePressEvent(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.LeftButton:
-            pos = event.position()
-            px = self._time_to_x(self._playhead_time)
-            if abs(pos.x() - px) < 8:
-                self._dragging_playhead = True
+        pos = event.position()
+        btn = event.button()
+
+        if btn == Qt.MouseButton.LeftButton:
+            # Playhead drag?
+            ph_x = self._t2x(self._playhead_time)
+            if abs(pos.x() - ph_x) < 8 and pos.y() < RULER_H + 10:
+                self._drag_playhead = True
                 return
 
-            kf_hit = self._hit_keyframe(pos.x(), pos.y())
-            if kf_hit is not None:
-                self._dragging_kf = kf_hit
+            # Keyframe hit?
+            hit = self._hit_kf(pos.x(), pos.y())
+            if hit is not None:
+                ti, ki = hit
+                self._drag_kf = hit
+                self._selected_kf = hit
+                # Seek to that time
+                kf_time = self._tracks[ti]["keyframes"][ki][0]
+                self.seek_requested.emit(kf_time)
+                self.keyframe_selected.emit(self._tracks[ti]["id"], ki)
+                self.update()
                 return
 
-            if pos.y() < RULER_HEIGHT:
-                t = self._x_to_time(pos.x())
-                t = max(0.0, min(t, self._duration))
+            # Ruler click → seek
+            if pos.y() < RULER_H:
+                t = max(0.0, min(self._x2t(pos.x()), self._duration))
                 self.seek_requested.emit(t)
-                self._dragging_playhead = True
+                self._drag_playhead = True
+
+        elif btn == Qt.MouseButton.RightButton:
+            hit = self._hit_kf(pos.x(), pos.y())
+            if hit is not None:
+                self._show_kf_menu(hit, event.globalPosition().toPoint())
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
+        pos = event.position()
         if event.button() == Qt.MouseButton.LeftButton:
-            pos = event.position()
-            track_idx = self._y_to_track(pos.y())
-            if track_idx is not None and track_idx < len(self._tracks):
-                t = self._x_to_time(pos.x())
-                t = max(0.0, min(t, self._duration))
-                self.keyframe_added.emit(self._tracks[track_idx]["id"], t)
+            ti = self._y2track(pos.y())
+            if ti is not None and ti < len(self._tracks):
+                t = max(0.0, min(self._x2t(pos.x()), self._duration))
+                self.keyframe_added.emit(self._tracks[ti]["id"], t)
 
     def mouseMoveEvent(self, event: QMouseEvent):
         pos = event.position()
-        if self._dragging_playhead:
-            t = self._x_to_time(pos.x())
-            t = max(0.0, min(t, self._duration))
+
+        if self._drag_playhead:
+            t = max(0.0, min(self._x2t(pos.x()), self._duration))
             self.seek_requested.emit(t)
-        elif self._dragging_kf is not None:
-            ti, ki = self._dragging_kf
-            t = self._x_to_time(pos.x())
-            t = max(0.0, min(t, self._duration))
+
+        elif self._drag_kf is not None:
+            ti, ki = self._drag_kf
+            t = max(0.0, min(self._x2t(pos.x()), self._duration))
             if ti < len(self._tracks):
                 self.keyframe_moved.emit(self._tracks[ti]["id"], ki, t)
 
+        else:
+            # Hover tooltip
+            hit = self._hit_kf(pos.x(), pos.y())
+            if hit is not None:
+                ti, ki = hit
+                kf = self._tracks[ti]["keyframes"][ki]
+                mins = int(kf[0]) // 60
+                secs = kf[0] - mins * 60
+                tip = (
+                    f"时间: {mins}:{secs:05.2f}\n"
+                    f"X (左右): {kf[1]:+.3f}\n"
+                    f"Z (前后): {kf[2]:+.3f}\n"
+                    f"Y (高度): {kf[3]:+.3f}"
+                )
+                QToolTip.showText(event.globalPosition().toPoint(), tip, self)
+            else:
+                QToolTip.hideText()
+
     def mouseReleaseEvent(self, event: QMouseEvent):
-        self._dragging_playhead = False
-        self._dragging_kf = None
+        self._drag_playhead = False
+        self._drag_kf = None
 
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             factor = 1.15 if delta > 0 else 1 / 1.15
-            self._pixels_per_second = max(5.0, min(300.0, self._pixels_per_second * factor))
+            self._pixels_per_sec = max(5.0, min(400.0, self._pixels_per_sec * factor))
         else:
-            self._scroll_offset -= delta * 0.5
-            self._scroll_offset = max(0, self._scroll_offset)
+            self._scroll_x = max(0.0, self._scroll_x - delta * 0.5)
         self.update()
 
-    def _y_to_track(self, y: float) -> int | None:
-        idx = int((y - RULER_HEIGHT) / TRACK_ROW_HEIGHT)
-        if idx < 0 or idx >= len(self._tracks):
-            return None
-        return idx
+    # ── Context menu ──────────────────────────────────────────────
 
-    def _hit_keyframe(self, mx: float, my: float) -> tuple[int, int] | None:
+    def _show_kf_menu(self, hit: tuple[int, int], global_pos):
+        ti, ki = hit
+        track = self._tracks[ti]
+        kf = track["keyframes"][ki]
+        tid = track["id"]
+
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: #2A2A2A;
+                border: 1px solid #444;
+                color: {TEXT_PRIMARY};
+            }}
+            QMenu::item:selected {{ background-color: {ACCENT}; color: #000; }}
+            QMenu::separator {{ background: #444; height: 1px; margin: 3px 0; }}
+        """)
+
+        mins = int(kf[0]) // 60
+        secs = kf[0] - mins * 60
+        info_str = f"{mins}:{secs:05.2f}  X{kf[1]:+.1f} Z{kf[2]:+.1f} Y{kf[3]:+.1f}"
+        info_act = QAction(info_str, menu)
+        info_act.setEnabled(False)
+        menu.addAction(info_act)
+        menu.addSeparator()
+
+        del_act = menu.addAction("删除此关键帧")
+        clear_act = menu.addAction(f"清除此音轨全部关键帧 ({len(track['keyframes'])} 个)")
+
+        chosen = menu.exec(global_pos)
+        if chosen == del_act:
+            self._selected_kf = None
+            self.keyframe_deleted.emit(tid, ki)
+        elif chosen == clear_act:
+            self._selected_kf = None
+            self.keyframes_cleared.emit(tid)
+
+    # ── Hit testing ───────────────────────────────────────────────
+
+    def _hit_kf(self, mx: float, my: float) -> tuple[int, int] | None:
         for ti, track in enumerate(self._tracks):
-            y_center = RULER_HEIGHT + ti * TRACK_ROW_HEIGHT + TRACK_ROW_HEIGHT // 2
-            if abs(my - y_center) > KEYFRAME_RADIUS + 4:
+            cy = RULER_H + ti * ROW_H + ROW_H // 2
+            if abs(my - cy) > KF_HALF + 4:
                 continue
             for ki, kf in enumerate(track.get("keyframes", [])):
-                kx = self._time_to_x(kf[0])
-                if abs(mx - kx) < KEYFRAME_RADIUS + 4:
+                kx = self._t2x(kf[0])
+                if abs(mx - kx) < KF_HALF + 4:
                     return (ti, ki)
         return None
+
+    def _y2track(self, y: float) -> int | None:
+        idx = int((y - RULER_H) / ROW_H)
+        return None if idx < 0 else idx
