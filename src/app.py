@@ -7,46 +7,52 @@ Coordinate convention (internal)
     pos[1]  = iy   internal Y = user Z   front(+) / back(−)
     pos[2]  = iz   internal Z = user Y   height
 
-Recording workflow
-------------------
-1. Keyframe mode  : user presses "+KF" or double-clicks timeline row
-                    → adds a single keyframe at current playback time with current position
-2. Recording mode : user enables "● REC" on a track and presses Play
-                    → dragging the SpatialPad (or the coordinate spinboxes) continuously
-                      records a dense position trace that is later simplified into keyframes
-3. Playback       : the trajectory spline drives sphere position frame-accurately via the
-                    audio callback; UI is refreshed at ~60 fps by a sync timer
+Recording workflow (R-key)
+--------------------------
+1. User enables "● REC" on one or more tracks.
+2. User presses and HOLDS the R key:
+   → Playback starts automatically (if not already playing).
+   → All REC-active tracks enter recording state.
+   → Position is sampled at ~60 Hz from the current _positions[tid] array.
+3. User releases R:
+   → Sampling stops.
+   → Trajectory is simplified (RDP decimation).
+   → Keyframes and segments are written to the timeline.
 
-Audio-UI sync guarantee
+Manual keyframe workflow
 ------------------------
-  • The audio-thread callback reads `_positions[tid]` (np.ndarray) via
-    `_audio_param_callback`.  The sync timer writes positions from the spline.
-  • During recording the audio callback reads from `_positions[tid]` which is
-    updated in the main thread via position_changed → _on_coord_changed.
-    numpy scalar assignment is GIL-safe for our use case.
+1. Seek to desired time (click ruler / drag playhead).
+2. Adjust position via left-panel X/Z/Y spinboxes or drag sphere in 3D viewport.
+3. Press "+KF" or double-click timeline row → keyframe stamped.
+
+Segment motion type editing
+----------------------------
+Click on the colored line between two adjacent keyframe diamonds in the timeline
+→ MotionTypeDialog opens for that segment.
+
+Single data structure
+---------------------
+All keyframes – whether from manual editing or R-key recording – are stored in
+the same Trajectory._keyframes list.  No second keyframe system exists.
 """
 
 import os
 import numpy as np
-from PyQt6.QtWidgets import (
-    QMainWindow, QSplitter, QFileDialog, QMessageBox,
-)
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import QMainWindow, QSplitter, QFileDialog, QMessageBox
+from PyQt6.QtCore    import Qt, QTimer
 
-from src.ui.theme import GLOBAL_STYLESHEET
-from src.ui.toolbar import Toolbar
+from src.ui.theme    import GLOBAL_STYLESHEET
+from src.ui.toolbar  import Toolbar
 from src.ui.track_panel import TrackPanel
-from src.ui.timeline import TimelineWidget
+from src.ui.timeline    import TimelineWidget
 from src.scene.viewport import Viewport3D
-from src.audio.engine import AudioEngine
-from src.audio.track import TrackBuffer
+from src.audio.engine   import AudioEngine
+from src.audio.track    import TrackBuffer
 from src.audio.exporter import export_mix
 from src.core.spatial_mapper import SpatialMapper
-from src.core.collision import CollisionResolver
-from src.core.trajectory import Trajectory
-from src.constants import (
-    TRACK_COLORS, DEFAULT_POSITIONS, SAMPLE_RATE, UI_REFRESH_MS,
-)
+from src.core.collision      import CollisionResolver
+from src.core.trajectory     import Trajectory
+from src.constants import TRACK_COLORS, DEFAULT_POSITIONS, SAMPLE_RATE, UI_REFRESH_MS
 
 
 class MainWindow(QMainWindow):
@@ -57,17 +63,19 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(GLOBAL_STYLESHEET)
         self.setAcceptDrops(True)
 
-        self._next_track_id = 0
+        self._next_track_id   = 0
         self._track_buffers: dict[int, TrackBuffer] = {}
-        self._trajectories: dict[int, Trajectory] = {}
-        self._positions: dict[int, np.ndarray] = {}
+        self._trajectories:  dict[int, Trajectory]  = {}
+        self._positions:     dict[int, np.ndarray]   = {}
 
-        # Track IDs currently in recording mode (REC button active)
+        # Tracks whose REC button is active
         self._rec_tracks: set[int] = set()
+        # Whether the R key is currently held (global recording gate)
+        self._r_key_held: bool = False
 
-        self.spatial_mapper = SpatialMapper()
+        self.spatial_mapper     = SpatialMapper()
         self.collision_resolver = CollisionResolver()
-        self.audio_engine = AudioEngine()
+        self.audio_engine       = AudioEngine()
         self.audio_engine.set_param_callback(self._audio_param_callback)
 
         self._build_ui()
@@ -81,12 +89,12 @@ class MainWindow(QMainWindow):
     # ── UI construction ───────────────────────────────────────────
 
     def _build_ui(self):
-        self.toolbar = Toolbar()
+        self.toolbar     = Toolbar()
         self.addToolBar(self.toolbar)
 
         self.track_panel = TrackPanel()
-        self.viewport = Viewport3D()
-        self.timeline = TimelineWidget()
+        self.viewport    = Viewport3D()
+        self.timeline    = TimelineWidget()
 
         h_splitter = QSplitter(Qt.Orientation.Horizontal)
         h_splitter.addWidget(self.track_panel)
@@ -125,13 +133,14 @@ class MainWindow(QMainWindow):
         self.timeline.keyframe_deleted.connect(self._on_keyframe_deleted)
         self.timeline.keyframes_cleared.connect(self._on_keyframes_cleared)
         self.timeline.keyframe_selected.connect(self._on_keyframe_selected)
+        self.timeline.interval_clicked.connect(self._on_interval_clicked)
 
     # ── Track management ─────────────────────────────────────────
 
     def _add_track(self, filepath: str):
         tid = self._next_track_id
         self._next_track_id += 1
-        color = TRACK_COLORS[tid % len(TRACK_COLORS)]
+        color       = TRACK_COLORS[tid % len(TRACK_COLORS)]
         default_pos = DEFAULT_POSITIONS[tid % len(DEFAULT_POSITIONS)]
 
         try:
@@ -142,8 +151,8 @@ class MainWindow(QMainWindow):
 
         buf.priority = 0
         self._track_buffers[tid] = buf
-        self._trajectories[tid] = Trajectory()
-        self._positions[tid] = np.array(default_pos, dtype=np.float64)
+        self._trajectories[tid]  = Trajectory()
+        self._positions[tid]     = np.array(default_pos, dtype=np.float64)
 
         self.audio_engine.add_track(buf)
         self.track_panel.add_track(tid, buf.name, color)
@@ -185,7 +194,9 @@ class MainWindow(QMainWindow):
             self.track_panel.set_playing(True)
 
     def _on_stop(self):
-        # Deactivate all REC buttons first (each fires rec_toggled → finish_recording)
+        # Deactivate all REC buttons first
+        if self._r_key_held:
+            self._finish_r_recording()
         self.track_panel.stop_all_recording()
 
         self.audio_engine.stop()
@@ -213,19 +224,12 @@ class MainWindow(QMainWindow):
         if tid in self._track_buffers:
             self._track_buffers[tid].priority = value
 
-    # ── Coordinate changes (spinbox or SpatialPad drag) ──────────
+    # ── Coordinate changes (spinboxes or 3D viewport drag) ───────
 
     def _on_coord_changed(self, tid: int, ix: float, iy: float, iz: float):
-        """Update sphere position and optionally record trajectory frame."""
-        pos = np.array([ix, iy, iz], dtype=np.float64)
-        self._positions[tid] = pos
+        """Position changed from left-panel spinboxes."""
+        self._positions[tid] = np.array([ix, iy, iz], dtype=np.float64)
         self.viewport.set_sphere_position(tid, (ix, iy, iz))
-
-        # Only record trajectory when REC is active AND playback is running.
-        # This prevents accidental trajectory writes when merely adjusting position.
-        if tid in self._rec_tracks and self.audio_engine.playing:
-            t = self.audio_engine.get_time()
-            self._trajectories[tid].record_frame(t, ix, iy, iz)
 
     # ── Keyframe management ───────────────────────────────────────
 
@@ -241,7 +245,7 @@ class MainWindow(QMainWindow):
         self._refresh_trajectory(tid)
 
     def _on_keyframe_added(self, tid: int, time_sec: float):
-        """Double-click in timeline row: add keyframe at clicked time."""
+        """Double-click timeline row: add keyframe at clicked time."""
         traj = self._trajectories.get(tid)
         pos  = self._positions.get(tid)
         if traj is not None and pos is not None:
@@ -250,7 +254,6 @@ class MainWindow(QMainWindow):
             self._refresh_trajectory(tid)
 
     def _on_keyframe_moved(self, tid: int, kf_idx: int, new_time: float):
-        """Drag keyframe diamond in timeline."""
         traj = self._trajectories.get(tid)
         if traj is not None and 0 <= kf_idx < len(traj.keyframes):
             _, x, y, z = traj.keyframes[kf_idx]
@@ -259,7 +262,6 @@ class MainWindow(QMainWindow):
             self._refresh_trajectory(tid)
 
     def _on_keyframe_deleted(self, tid: int, kf_idx: int):
-        """Delete a single keyframe (right-click → Delete)."""
         traj = self._trajectories.get(tid)
         if traj is not None and 0 <= kf_idx < len(traj.keyframes):
             traj.remove_keyframe(kf_idx)
@@ -267,7 +269,6 @@ class MainWindow(QMainWindow):
             self._refresh_trajectory(tid)
 
     def _on_keyframes_cleared(self, tid: int):
-        """Clear all keyframes for a track (right-click → Clear All)."""
         traj = self._trajectories.get(tid)
         if traj is not None:
             traj.clear()
@@ -275,10 +276,6 @@ class MainWindow(QMainWindow):
             self._refresh_trajectory(tid)
 
     def _on_keyframe_selected(self, tid: int, kf_idx: int):
-        """
-        User clicked a keyframe diamond in the timeline.
-        Show the keyframe's position in the TrackPanel (seek already done by timeline).
-        """
         traj = self._trajectories.get(tid)
         if traj is not None and 0 <= kf_idx < len(traj.keyframes):
             _, x, y, z = traj.keyframes[kf_idx]
@@ -286,36 +283,87 @@ class MainWindow(QMainWindow):
             self._positions[tid] = np.array([x, y, z], dtype=np.float64)
             self.viewport.set_sphere_position(tid, (x, y, z))
 
-    # ── Per-track recording toggle ────────────────────────────────
+    # ── Segment / interval editing ────────────────────────────────
+
+    def _on_interval_clicked(self, tid: int, seg_idx: int):
+        """User clicked a segment line in the timeline → open motion-type dialog."""
+        from src.ui.motion_type_dialog import MotionTypeDialog
+        traj = self._trajectories.get(tid)
+        if traj is None or seg_idx >= len(traj.segments):
+            return
+        seg = traj.segments[seg_idx]
+        dlg = MotionTypeDialog(seg, parent=self)
+        if dlg.exec():
+            traj.set_segment_motion(
+                seg_idx,
+                dlg.selected_motion_type,
+                dlg.custom_bezier_points,
+            )
+            self._update_timeline_data()
+            self._refresh_trajectory(tid)
+
+    # ── Per-track REC button ──────────────────────────────────────
 
     def _on_track_rec_toggled(self, tid: int, active: bool):
         if active:
             self._rec_tracks.add(tid)
         else:
             self._rec_tracks.discard(tid)
+            # Only finalize if R is not currently held
+            if not self._r_key_held:
+                traj = self._trajectories.get(tid)
+                if traj:
+                    traj.finish_recording()
+                self._update_timeline_data()
+                self._refresh_trajectory(tid)
+
+    # ── R-key recording ───────────────────────────────────────────
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_R and not event.isAutoRepeat():
+            self._start_r_recording()
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key.Key_R and not event.isAutoRepeat():
+            self._finish_r_recording()
+        super().keyReleaseEvent(event)
+
+    def _start_r_recording(self):
+        if not self._rec_tracks:
+            return  # No tracks have REC armed → nothing to do
+        self._r_key_held = True
+        # Auto-start playback
+        if not self.audio_engine.playing:
+            self.audio_engine.play()
+            self.toolbar.set_playing(True)
+            self.track_panel.set_playing(True)
+        # Visual feedback
+        self.track_panel.set_global_rec_active(True)
+
+    def _finish_r_recording(self):
+        if not self._r_key_held:
+            return
+        self._r_key_held = False
+        self.track_panel.set_global_rec_active(False)
+        # Simplify all recording trajectories
+        for tid in list(self._rec_tracks):
             traj = self._trajectories.get(tid)
             if traj:
                 traj.finish_recording()
-            self._update_timeline_data()
-            self._refresh_trajectory(tid)
+        self._update_timeline_data()
+        self._refresh_all_trajectories()
 
     # ── Audio parameter callback (audio thread) ───────────────────
 
     def _audio_param_callback(self, track: TrackBuffer, frame: int):
-        """
-        Called from the sounddevice audio thread for every block.
-        Must be fast and non-blocking.
-
-        Returns (gain, pan, cutoff) computed from the track's current position.
-        During recording the position is whatever the user dragged to last;
-        during normal playback it is driven by the trajectory spline.
-        """
+        """Called from the sounddevice audio thread for every block."""
         tid = track.track_id
         t   = frame / SAMPLE_RATE
 
         traj = self._trajectories.get(tid)
-        if traj and len(traj.keyframes) >= 2 and tid not in self._rec_tracks:
-            # Spline-driven position (frame-accurate)
+        recording_active = self._r_key_held and tid in self._rec_tracks
+        if traj and len(traj.keyframes) >= 2 and not recording_active:
             pos = traj.get_position(t)
         else:
             pos = self._positions.get(tid, np.zeros(3))
@@ -330,23 +378,39 @@ class MainWindow(QMainWindow):
         self.toolbar.set_time(t)
         self.timeline.set_playhead(t)
 
+        # Poll 3D viewport sphere drag → update positions/spinboxes
+        drag_result = self.viewport.poll_drag()
+        if drag_result is not None:
+            drag_tid, drag_pos = drag_result
+            ix, iy, iz = drag_pos
+            self._positions[drag_tid] = np.array([ix, iy, iz], dtype=np.float64)
+            self.track_panel.set_track_position(drag_tid, ix, iy, iz)
+
         if not self.audio_engine.playing:
             return
 
         self._resolve_collisions()
 
+        # R-key recording: sample current positions at ~60 Hz
+        if self._r_key_held:
+            for tid in self._rec_tracks:
+                pos = self._positions.get(tid, np.zeros(3))
+                self._trajectories[tid].record_frame(
+                    t, float(pos[0]), float(pos[1]), float(pos[2])
+                )
+
         # Advance trajectory-driven positions for non-recording tracks
         for tid, traj in self._trajectories.items():
-            if tid in self._rec_tracks:
-                continue   # position is already live from SpatialPad drag
-            if traj.keyframes and len(traj.keyframes) >= 2:
+            if self._r_key_held and tid in self._rec_tracks:
+                continue  # position is live from user interaction
+            if len(traj.keyframes) >= 2:
                 pos = traj.get_position(t)
                 self._positions[tid] = pos
                 px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
                 self.viewport.set_sphere_position(tid, (px, py, pz))
                 self.track_panel.set_track_position(tid, px, py, pz)
 
-        # Glow brightness from gain
+        # Sphere glow from gain
         for tid, pos in self._positions.items():
             if tid in self.viewport.spheres:
                 gain, _, _ = self.spatial_mapper.compute(pos)
@@ -364,19 +428,24 @@ class MainWindow(QMainWindow):
             if tid in self._track_buffers:
                 self._track_buffers[tid].duck_gain = dg
 
-    # ── Timeline / SpatialPad data sync ──────────────────────────
+    # ── Timeline data sync ────────────────────────────────────────
 
     def _update_timeline_data(self):
         data = []
         for tid, buf in self._track_buffers.items():
             color = TRACK_COLORS[tid % len(TRACK_COLORS)]
             traj  = self._trajectories.get(tid)
+            segs_data = []
+            if traj:
+                for seg in traj.segments:
+                    segs_data.append({"motion_type": seg.motion_type.value})
             data.append({
                 "id":             tid,
                 "name":           buf.name,
                 "color":          color,
                 "waveform":       buf.get_waveform_overview(),
                 "keyframes":      traj.keyframes if traj else [],
+                "segments":       segs_data,
                 "track_duration": buf.duration,
             })
         self.timeline.set_tracks(data)
@@ -384,16 +453,13 @@ class MainWindow(QMainWindow):
         self.timeline.set_duration(max(dur, 10.0))
 
     def _refresh_trajectory(self, tid: int):
-        """Update both the 3D viewport trajectory and the SpatialPad motion path."""
         traj = self._trajectories.get(tid)
         if traj is None:
             return
         color = TRACK_COLORS[tid % len(TRACK_COLORS)]
-        pts = traj.get_curve_points()
-        # 3D viewport
+        pts   = traj.get_curve_points()
         self.viewport.update_trajectory(tid, pts, color)
-        # SpatialPad (2D overlay in track panel)
-        self.track_panel.update_track_trajectory(tid, pts, traj.keyframes)
+        # No SpatialPad to update; track_panel.update_track_trajectory is a no-op
 
     def _refresh_all_trajectories(self):
         for tid in self._trajectories:
@@ -423,7 +489,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
 
-    # ── Drag and Drop ────────────────────────────────────────────
+    # ── Drag and drop ────────────────────────────────────────────
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -433,7 +499,8 @@ class MainWindow(QMainWindow):
         for url in event.mimeData().urls():
             path = url.toLocalFile()
             if path and os.path.isfile(path):
-                if os.path.splitext(path)[1].lower() in (".wav", ".flac", ".ogg", ".mp3"):
+                ext = os.path.splitext(path)[1].lower()
+                if ext in (".wav", ".flac", ".ogg", ".mp3"):
                     self._add_track(path)
 
     # ── Cleanup ──────────────────────────────────────────────────
