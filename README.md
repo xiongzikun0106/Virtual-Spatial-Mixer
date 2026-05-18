@@ -18,9 +18,26 @@ pip install -r requirements.txt
 
 ## 运行
 
+### 桌面 PyQt（默认）
+
 ```bash
 python main.py
 ```
+
+### pywebview + TypeScript（方案 A，Windows 为 WebView2）
+
+音频与 DSP 仍在 Python；界面为 ``frontend`` 下的 Vite + TypeScript 构建产物。
+
+```bash
+cd frontend && npm install && npm run build && cd ..
+python main.py --webview
+```
+
+仓库中已包含一次构建好的 ``frontend/dist``，若未改前端可直接 ``python main.py --webview``。
+
+开发前端时可另开 ``npm run dev``，并设置环境变量 ``VSM_DEV_URL=http://127.0.0.1:5173`` 后启动 ``--webview``（需自行处理跨域或仅用浏览器调试页面）。
+
+Windows 需安装 [WebView2 运行时](https://developer.microsoft.com/microsoft-edge/webview2/)；其他平台由 pywebview 选用系统 WebKit 等后端。
 
 ## 使用流程
 
@@ -34,8 +51,9 @@ python main.py
 ## 技术栈
 
 - Python 3.10+
-- PyQt6 (UI)
-- pyqtgraph (3D 渲染)
-- sounddevice (音频播放)
-- numpy / scipy (DSP)
-- soundfile (音频文件 I/O)
+- PyQt6（默认 UI）/ **pywebview**（可选 TS 前端壳）
+- TypeScript + Vite + three.js（``--webview`` 界面）
+- pyqtgraph（仅 PyQt 模式下的 3D 渲染）
+- sounddevice（音频播放）
+- numpy / scipy（DSP）
+- soundfile（音频文件 I/O）
